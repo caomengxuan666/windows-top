@@ -21,6 +21,8 @@
 #include <chrono>
 #include <cmath>
 #include <conio.h>
+#include <cctype>
+#include <cstdlib>
 #include <cwctype>
 #include <iomanip>
 #include <iostream>
@@ -99,6 +101,24 @@ std::string wide_to_utf8(const std::wstring& value) {
   std::string out(static_cast<size_t>(needed), '\0');
   WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
                       out.data(), needed, nullptr, nullptr);
+  return out;
+}
+
+std::wstring utf8_to_wide(const std::string& value) {
+  if (value.empty()) {
+    return {};
+  }
+
+  const int needed = MultiByteToWideChar(CP_UTF8, 0, value.data(),
+                                         static_cast<int>(value.size()), nullptr,
+                                         0);
+  if (needed <= 0) {
+    return {};
+  }
+
+  std::wstring out(static_cast<size_t>(needed), L'\0');
+  MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
+                      out.data(), needed);
   return out;
 }
 
@@ -554,7 +574,7 @@ void print_colored(HANDLE out, WORD color, const std::string& text,
                    bool interactive);
 void print_header_bar(const std::string& text, short width, HANDLE out,
                       bool interactive);
-bool handle_interactive_key(int ch, Options& options, bool& quit);
+bool handle_interactive_key(int ch, Options& options, HANDLE out, bool& quit);
 
 void print_table(const std::vector<ProcessRow>& rows, const Options& options,
                  HANDLE out, bool interactive, int max_rows = -1) {
@@ -837,7 +857,149 @@ void print_summary(const SystemSnapshot& system, size_t process_count,
   std::cout << fit_line_to_width(swap_line.str(), width, false) << "\n\n";
 }
 
-bool handle_interactive_key(int ch, Options& options, bool& quit) {
+std::string prompt_line(const std::string& prompt) {
+  std::cout << "\n" << prompt;
+  std::cout.flush();
+
+  std::string input;
+  std::getline(std::cin, input);
+  return input;
+}
+
+void show_temporary_message(const std::string& message) {
+  std::cout << message << "\n";
+  std::cout.flush();
+  std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+}
+
+bool parse_pid(const std::string& text, DWORD& pid) {
+  char* end = nullptr;
+  const unsigned long value = std::strtoul(text.c_str(), &end, 10);
+  if (end == text.c_str() || value == 0 || value > MAXDWORD) {
+    return false;
+  }
+
+  pid = static_cast<DWORD>(value);
+  return true;
+}
+
+bool parse_priority_class(const std::string& text, DWORD& priority_class) {
+  std::string value = text;
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+
+  if (value == "idle") {
+    priority_class = IDLE_PRIORITY_CLASS;
+    return true;
+  }
+  if (value == "below" || value == "below_normal") {
+    priority_class = BELOW_NORMAL_PRIORITY_CLASS;
+    return true;
+  }
+  if (value == "normal") {
+    priority_class = NORMAL_PRIORITY_CLASS;
+    return true;
+  }
+  if (value == "above" || value == "above_normal") {
+    priority_class = ABOVE_NORMAL_PRIORITY_CLASS;
+    return true;
+  }
+  if (value == "high") {
+    priority_class = HIGH_PRIORITY_CLASS;
+    return true;
+  }
+  if (value == "realtime" || value == "real-time") {
+    priority_class = REALTIME_PRIORITY_CLASS;
+    return true;
+  }
+
+  char* end = nullptr;
+  const long numeric = std::strtol(value.c_str(), &end, 10);
+  if (end == value.c_str()) {
+    return false;
+  }
+
+  if (numeric <= 3) {
+    priority_class = IDLE_PRIORITY_CLASS;
+  } else if (numeric <= 6) {
+    priority_class = BELOW_NORMAL_PRIORITY_CLASS;
+  } else if (numeric <= 10) {
+    priority_class = NORMAL_PRIORITY_CLASS;
+  } else if (numeric <= 13) {
+    priority_class = ABOVE_NORMAL_PRIORITY_CLASS;
+  } else if (numeric <= 23) {
+    priority_class = HIGH_PRIORITY_CLASS;
+  } else {
+    priority_class = REALTIME_PRIORITY_CLASS;
+  }
+  return true;
+}
+
+void prompt_for_delay(Options& options) {
+  const std::string input = prompt_line("Enter new delay (seconds): ");
+  char* end = nullptr;
+  const double parsed = std::strtod(input.c_str(), &end);
+  if (end != input.c_str() && parsed > 0.0 && std::isfinite(parsed)) {
+    options.delay_seconds = parsed;
+  }
+}
+
+void prompt_for_kill() {
+  DWORD pid = 0;
+  if (!parse_pid(prompt_line("Enter PID to kill: "), pid)) {
+    show_temporary_message("Invalid PID.");
+    return;
+  }
+
+  HANDLE process = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+  if (process == nullptr) {
+    show_temporary_message("Failed to open process.");
+    return;
+  }
+
+  const BOOL ok = TerminateProcess(process, 1);
+  CloseHandle(process);
+  show_temporary_message(ok ? "Process terminated successfully."
+                            : "Failed to terminate process.");
+}
+
+void prompt_for_priority() {
+  DWORD pid = 0;
+  if (!parse_pid(prompt_line("Enter PID to change priority: "), pid)) {
+    show_temporary_message("Invalid PID.");
+    return;
+  }
+
+  DWORD priority_class = 0;
+  if (!parse_priority_class(
+          prompt_line("Enter priority (idle, below, normal, above, high, "
+                      "realtime, or 0-31): "),
+          priority_class)) {
+    show_temporary_message("Invalid priority.");
+    return;
+  }
+
+  HANDLE process = OpenProcess(PROCESS_SET_INFORMATION, FALSE, pid);
+  if (process == nullptr) {
+    show_temporary_message("Failed to open process.");
+    return;
+  }
+
+  const BOOL ok = SetPriorityClass(process, priority_class);
+  CloseHandle(process);
+  show_temporary_message(ok ? "Priority changed successfully."
+                            : "Failed to change priority.");
+}
+
+void prompt_for_user_filter(Options& options) {
+  const std::string input =
+      prompt_line("Enter username to filter (empty to clear): ");
+  options.user_filter = upper(utf8_to_wide(input));
+}
+
+bool handle_interactive_key(int ch, Options& options, HANDLE out, bool& quit) {
+  (void)out;
   switch (ch) {
     case 'q':
     case 'Q':
@@ -871,6 +1033,24 @@ bool handle_interactive_key(int ch, Options& options, bool& quit) {
     case 'i':
     case 'I':
       options.ignore_idle = !options.ignore_idle;
+      return true;
+    case 's':
+    case 'S':
+    case 'd':
+    case 'D':
+      prompt_for_delay(options);
+      return true;
+    case 'k':
+    case 'K':
+      prompt_for_kill();
+      return true;
+    case 'r':
+    case 'R':
+      prompt_for_priority();
+      return true;
+    case 'u':
+    case 'U':
+      prompt_for_user_filter(options);
       return true;
     default:
       return false;
@@ -908,7 +1088,7 @@ int run_top(const Options& options) {
           if (_kbhit()) {
             const int ch = _getch();
             bool quit = false;
-            if (handle_interactive_key(ch, effective, quit)) {
+            if (handle_interactive_key(ch, effective, out, quit)) {
               if (quit) {
                 return 0;
               }
@@ -962,7 +1142,7 @@ int run_top(const Options& options) {
       if (_kbhit()) {
         const int ch = _getch();
         bool quit = false;
-        handle_interactive_key(ch, effective, quit);
+        handle_interactive_key(ch, effective, out, quit);
         if (quit) {
           break;
         }

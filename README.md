@@ -32,7 +32,9 @@ top -u SYSTEM
 
 In interactive mode, press `q` or `Esc` to exit. Press `P`, `M`, `T`, or `N`
 to sort by CPU, memory, time, or PID. Press `C`, `H`, or `I` to toggle command
-paths, thread counts, or idle processes.
+paths, thread counts, or idle processes. Press `S`/`D` to change delay, `K` to
+terminate a process, `R` to change process priority, or `U` to set a user
+filter.
 
 Options:
 
