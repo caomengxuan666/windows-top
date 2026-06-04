@@ -1,3 +1,6 @@
+# Copyright (c) 2026 caomengxuan666
+# windows-top is extracted from WinuxCmd and licensed under the MIT License.
+
 cmake_minimum_required(VERSION 3.20)
 
 project(windows-top

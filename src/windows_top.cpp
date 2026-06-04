@@ -1,17 +1,31 @@
+/*
+ * Copyright (c) 2026 caomengxuan666
+ *
+ * This file is part of windows-top.
+ *
+ * windows-top is a standalone C++17 implementation of a native Windows
+ * top command, extracted from the WinuxCmd project.
+ *
+ * Licensed under the MIT License. See the LICENSE file in the project root
+ * for the full license text.
+ */
+
 #define NOMINMAX
 #include <windows.h>
 #include <psapi.h>
 #include <tlhelp32.h>
 
-#include "windows_top/windows_top.h"
+#include "winuxcmd/windows_top.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <conio.h>
+#include <cwctype>
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -27,9 +41,14 @@ struct Options {
   bool batch_mode = false;
   int iterations = kDefaultIterations;
   double delay_seconds = kDefaultDelaySeconds;
-  DWORD pid = 0;
+  std::set<DWORD> pids;
   std::wstring sort_by = L"CPU";
+  std::wstring user_filter;
   bool no_headers = false;
+  bool show_command = false;
+  bool show_threads = false;
+  bool ignore_idle = false;
+  int width = 120;
 };
 
 struct ProcessSample {
@@ -38,6 +57,8 @@ struct ProcessSample {
   DWORD threads = 0;
   LONG base_priority = 0;
   std::wstring name;
+  std::wstring path;
+  std::string user;
   SIZE_T working_set = 0;
   SIZE_T private_bytes = 0;
   unsigned long long cpu_time = 0;
@@ -129,16 +150,54 @@ DWORD parse_pid(const wchar_t* value) {
   return static_cast<DWORD>(parsed);
 }
 
+std::set<DWORD> parse_pid_list(const wchar_t* value) {
+  std::set<DWORD> pids;
+  if (value == nullptr) {
+    return pids;
+  }
+
+  std::wstring text(value);
+  size_t start = 0;
+  while (start <= text.size()) {
+    const size_t comma = text.find(L',', start);
+    const size_t end = comma == std::wstring::npos ? text.size() : comma;
+    const std::wstring part = text.substr(start, end - start);
+    if (!part.empty()) {
+      const DWORD pid = parse_pid(part.c_str());
+      if (pid != 0) {
+        pids.insert(pid);
+      }
+    }
+    if (comma == std::wstring::npos) {
+      break;
+    }
+    start = comma + 1;
+  }
+
+  return pids;
+}
+
+void add_pid_list(std::set<DWORD>& target, const wchar_t* value) {
+  auto parsed = parse_pid_list(value);
+  target.insert(parsed.begin(), parsed.end());
+}
+
 void print_usage() {
   std::cout
       << "Usage: top [OPTIONS]\n\n"
       << "Display dynamic real-time information about Windows processes.\n\n"
       << "Options:\n"
       << "  -b, --batch           print snapshots instead of interactive refresh\n"
+      << "  -c, --command         show process path when available\n"
       << "  -n, --iterations N    number of updates before exiting\n"
       << "  -d, --delay SECONDS   delay between updates\n"
+      << "  -H, --threads         show thread count column\n"
+      << "  -i, --idle-toggle     hide processes with 0% CPU in this snapshot\n"
       << "  -o, --sort FIELD      sort by CPU, MEM, TIME, PID, or NAME\n"
-      << "  -p, --pid PID         show only one process\n"
+      << "  -p, --pid PID[,PID]   show only selected processes\n"
+      << "  -u, --user USER       show only matching process owners\n"
+      << "  -U, --User USER       alias for --user on Windows\n"
+      << "  -w, --width WIDTH     limit command column width\n"
       << "      --no-headers      omit summary and table headers\n"
       << "  -h, --help            show this help\n"
       << "  -v, --version         show version\n";
@@ -173,6 +232,18 @@ bool parse_args(int argc, const wchar_t* const* argv, Options& options,
       options.no_headers = true;
       continue;
     }
+    if (arg == L"-c" || arg == L"--command") {
+      options.show_command = true;
+      continue;
+    }
+    if (arg == L"-H" || arg == L"--threads") {
+      options.show_threads = true;
+      continue;
+    }
+    if (arg == L"-i" || arg == L"--idle-toggle") {
+      options.ignore_idle = true;
+      continue;
+    }
     if ((arg == L"-n" || arg == L"--iterations") && i + 1 < argc) {
       options.iterations = parse_int(argv[++i], options.iterations);
       continue;
@@ -186,7 +257,17 @@ bool parse_args(int argc, const wchar_t* const* argv, Options& options,
       continue;
     }
     if ((arg == L"-p" || arg == L"--pid") && i + 1 < argc) {
-      options.pid = parse_pid(argv[++i]);
+      add_pid_list(options.pids, argv[++i]);
+      continue;
+    }
+    if ((arg == L"-u" || arg == L"--user" || arg == L"-U" ||
+         arg == L"--User") &&
+        i + 1 < argc) {
+      options.user_filter = upper(argv[++i]);
+      continue;
+    }
+    if ((arg == L"-w" || arg == L"--width") && i + 1 < argc) {
+      options.width = parse_int(argv[++i], options.width);
       continue;
     }
 
@@ -223,6 +304,57 @@ std::wstring process_name_from_entry(const PROCESSENTRY32W& entry) {
                             : std::wstring(L"[unknown]");
 }
 
+std::string get_process_user(HANDLE process) {
+  HANDLE token = nullptr;
+  if (!OpenProcessToken(process, TOKEN_QUERY, &token)) {
+    return "N/A";
+  }
+
+  DWORD size = 0;
+  GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+  if (size == 0) {
+    CloseHandle(token);
+    return "N/A";
+  }
+
+  std::vector<unsigned char> buffer(size);
+  if (!GetTokenInformation(token, TokenUser, buffer.data(), size, &size)) {
+    CloseHandle(token);
+    return "N/A";
+  }
+
+  const auto* token_user = reinterpret_cast<const TOKEN_USER*>(buffer.data());
+  WCHAR user[256]{};
+  WCHAR domain[256]{};
+  DWORD user_size = static_cast<DWORD>(sizeof(user) / sizeof(user[0]));
+  DWORD domain_size = static_cast<DWORD>(sizeof(domain) / sizeof(domain[0]));
+  SID_NAME_USE use = SidTypeUnknown;
+
+  if (!LookupAccountSidW(nullptr, token_user->User.Sid, user, &user_size, domain,
+                         &domain_size, &use)) {
+    CloseHandle(token);
+    return "N/A";
+  }
+
+  CloseHandle(token);
+
+  if (domain[0] != 0) {
+    return wide_to_utf8(std::wstring(domain) + L"\\" + user);
+  }
+  return wide_to_utf8(user);
+}
+
+std::wstring get_process_path(HANDLE process) {
+  std::wstring path(32768, L'\0');
+  DWORD size = static_cast<DWORD>(path.size());
+  if (!QueryFullProcessImageNameW(process, 0, path.data(), &size)) {
+    return {};
+  }
+
+  path.resize(size);
+  return path;
+}
+
 std::vector<ProcessSample> enumerate_processes() {
   std::vector<ProcessSample> processes;
 
@@ -251,6 +383,9 @@ std::vector<ProcessSample> enumerate_processes() {
         OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE,
                     entry.th32ProcessID);
     if (process != nullptr) {
+      sample.user = get_process_user(process);
+      sample.path = get_process_path(process);
+
       FILETIME create{}, exit{}, kernel{}, user{};
       if (GetProcessTimes(process, &create, &exit, &kernel, &user)) {
         sample.cpu_time = filetime_to_u64(kernel) + filetime_to_u64(user);
@@ -300,8 +435,14 @@ std::vector<ProcessRow> build_rows(const std::vector<ProcessSample>& previous,
   rows.reserve(current.size());
 
   for (const auto& sample : current) {
-    if (options.pid != 0 && sample.pid != options.pid) {
+    if (!options.pids.empty() && options.pids.count(sample.pid) == 0) {
       continue;
+    }
+    if (!options.user_filter.empty()) {
+      std::wstring user_wide(sample.user.begin(), sample.user.end());
+      if (upper(user_wide).find(options.user_filter) == std::wstring::npos) {
+        continue;
+      }
     }
 
     ProcessRow row;
@@ -319,6 +460,10 @@ std::vector<ProcessRow> build_rows(const std::vector<ProcessSample>& previous,
     if (current_system.total_memory != 0) {
       row.mem_percent = static_cast<double>(sample.working_set) * 100.0 /
                         static_cast<double>(current_system.total_memory);
+    }
+
+    if (options.ignore_idle && row.cpu_percent == 0.0) {
+      continue;
     }
 
     rows.push_back(std::move(row));
@@ -393,23 +538,36 @@ void print_summary(const SystemSnapshot& system, size_t process_count,
 void print_table(const std::vector<ProcessRow>& rows, const Options& options) {
   if (!options.no_headers) {
     std::cout << std::right << std::setw(7) << "PID" << " " << std::setw(7)
-              << "PPID" << " " << std::setw(4) << "THR" << " "
-              << std::setw(4) << "PRI" << " " << std::setw(6) << "%CPU"
+              << "PPID" << " ";
+    if (options.show_threads) {
+      std::cout << std::setw(4) << "THR" << " ";
+    }
+    std::cout << std::setw(4) << "PRI" << " " << std::setw(6) << "%CPU"
               << " " << std::setw(6) << "%MEM" << " " << std::setw(8)
               << "RES" << " " << std::setw(8) << "TIME" << " COMMAND\n";
   }
 
   for (const auto& row : rows) {
+    std::string command =
+        options.show_command && !row.sample.path.empty()
+            ? wide_to_utf8(row.sample.path)
+            : wide_to_utf8(row.sample.name);
+    if (options.width > 0 && static_cast<int>(command.size()) > options.width) {
+      command.resize(static_cast<size_t>(options.width));
+    }
+
     std::cout << std::right << std::setw(7) << row.sample.pid << " "
-              << std::setw(7) << row.sample.ppid << " " << std::setw(4)
-              << row.sample.threads << " " << std::setw(4)
-              << row.sample.base_priority << " " << std::setw(6)
+              << std::setw(7) << row.sample.ppid << " ";
+    if (options.show_threads) {
+      std::cout << std::setw(4) << row.sample.threads << " ";
+    }
+    std::cout << std::setw(4) << row.sample.base_priority << " " << std::setw(6)
               << std::fixed << std::setprecision(1) << row.cpu_percent << " "
               << std::setw(6) << std::fixed << std::setprecision(1)
               << row.mem_percent << " " << std::setw(8)
               << format_memory(row.sample.working_set) << " " << std::setw(8)
-              << format_cpu_time(row.sample.cpu_time) << " "
-              << wide_to_utf8(row.sample.name) << "\n";
+              << format_cpu_time(row.sample.cpu_time) << " " << command
+              << "\n";
   }
 }
 
@@ -508,9 +666,14 @@ Options from_c_options(const windows_top_options* options) {
                                             : options->iterations;
   out.delay_seconds = options->delay_seconds > 0.0 ? options->delay_seconds
                                                    : kDefaultDelaySeconds;
-  out.pid = static_cast<DWORD>(options->pid);
+  out.pids = parse_pid_list(options->pids);
   out.sort_by = options->sort_by ? upper(options->sort_by) : L"CPU";
+  out.user_filter = options->user ? upper(options->user) : L"";
   out.no_headers = options->no_headers != 0;
+  out.show_command = options->show_command != 0;
+  out.show_threads = options->show_threads != 0;
+  out.ignore_idle = options->ignore_idle != 0;
+  out.width = options->width > 0 ? options->width : 120;
   return out;
 }
 
@@ -534,4 +697,3 @@ int windows_top_run(int argc, const wchar_t* const* argv) {
 int windows_top_run_with_options(const windows_top_options* options) {
   return run_top(from_c_options(options));
 }
-

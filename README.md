@@ -22,19 +22,28 @@ ctest --test-dir build -C Debug --output-on-failure
 top
 top -b -n 1
 top -b -n 3 -d 1
+top -c
+top -H
 top -o CPU
 top -o MEM
-top -p 1234
+top -p 1234,5678
+top -u SYSTEM
 ```
 
 Options:
 
 ```text
 -b, --batch          print snapshots instead of interactive screen refresh
+-c, --command        show process path when available
 -n, --iterations N   number of updates before exiting
 -d, --delay SECONDS  delay between updates
+-H, --threads        show thread count column
+-i, --idle-toggle    hide processes with 0% CPU in this snapshot
 -o, --sort FIELD     sort by CPU, MEM, TIME, PID, or NAME
--p, --pid PID        show only one process
+-p, --pid PID[,PID]  show only selected processes
+-u, --user USER      show only matching process owners
+-U, --User USER      alias for --user on Windows
+-w, --width WIDTH    limit command column width
 --no-headers         omit summary and table headers
 -h, --help           show help
 -v, --version        show version
@@ -45,7 +54,7 @@ Options:
 The project exposes a small C ABI so other projects can embed it without depending on C++ symbols:
 
 ```c
-#include <windows_top/windows_top.h>
+#include <winuxcmd/windows_top.h>
 
 int exit_code = windows_top_run(argc, argv);
 ```
@@ -58,6 +67,8 @@ options.batch_mode = 1;
 options.iterations = 1;
 options.delay_seconds = 0.2;
 options.sort_by = L"CPU";
+options.show_threads = 1;
+options.width = 120;
 
 int exit_code = windows_top_run_with_options(&options);
 ```
@@ -70,4 +81,3 @@ This project is based on ideas and Windows process-monitoring code from WinuxCmd
 - no C++20 modules
 - no command macro system
 - C++17 and CMake only
-

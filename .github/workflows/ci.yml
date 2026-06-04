@@ -1,3 +1,6 @@
+# Copyright (c) 2026 caomengxuan666
+# windows-top is extracted from WinuxCmd and licensed under the MIT License.
+
 name: CI
 
 on:
@@ -24,4 +27,3 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure
-
