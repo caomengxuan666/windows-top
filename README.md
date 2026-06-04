@@ -30,6 +30,10 @@ top -p 1234,5678
 top -u SYSTEM
 ```
 
+In interactive mode, press `q` or `Esc` to exit. Press `P`, `M`, `T`, or `N`
+to sort by CPU, memory, time, or PID. Press `C`, `H`, or `I` to toggle command
+paths, thread counts, or idle processes.
+
 Options:
 
 ```text

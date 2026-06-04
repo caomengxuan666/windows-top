@@ -509,45 +509,80 @@ std::string format_cpu_time(unsigned long long filetime_ticks) {
   return out.str();
 }
 
-void print_summary(const SystemSnapshot& system, size_t process_count,
-                   double cpu_usage) {
-  const unsigned long long used_memory =
-      system.total_memory > system.available_memory
-          ? system.total_memory - system.available_memory
-          : 0;
-  const unsigned long long uptime_seconds = system.uptime_ms / 1000ULL;
-  const unsigned long long uptime_hours = uptime_seconds / 3600ULL;
-  const unsigned long long uptime_minutes = (uptime_seconds / 60ULL) % 60ULL;
+struct ConsoleView {
+  short left = 0;
+  short top = 0;
+  short width = 80;
+  short height = 25;
+  WORD attributes = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
+  bool valid = false;
+};
 
-  SYSTEMTIME local_time{};
-  GetLocalTime(&local_time);
+bool is_console_handle(HANDLE handle);
 
-  std::cout << "top - " << std::setw(2) << std::setfill('0')
-            << local_time.wHour << ":" << std::setw(2) << local_time.wMinute
-            << ":" << std::setw(2) << local_time.wSecond << std::setfill(' ')
-            << " up " << uptime_hours << ":" << std::setw(2)
-            << std::setfill('0') << uptime_minutes << std::setfill(' ')
-            << ", " << process_count << " processes\n";
-  std::cout << "%Cpu(s): " << std::fixed << std::setprecision(1) << cpu_usage
-            << " used\n";
-  std::cout << "MiB Mem : " << format_memory(system.total_memory) << " total, "
-            << format_memory(system.available_memory) << " free, "
-            << format_memory(used_memory) << " used\n";
-}
-
-void print_table(const std::vector<ProcessRow>& rows, const Options& options) {
-  if (!options.no_headers) {
-    std::cout << std::right << std::setw(7) << "PID" << " " << std::setw(7)
-              << "PPID" << " ";
-    if (options.show_threads) {
-      std::cout << std::setw(4) << "THR" << " ";
+class ConsoleAttributeGuard {
+ public:
+  explicit ConsoleAttributeGuard(HANDLE out) : out_(out) {
+    CONSOLE_SCREEN_BUFFER_INFO info{};
+    if (is_console_handle(out_) && GetConsoleScreenBufferInfo(out_, &info)) {
+      original_ = info.wAttributes;
+      active_ = true;
     }
-    std::cout << std::setw(4) << "PRI" << " " << std::setw(6) << "%CPU"
-              << " " << std::setw(6) << "%MEM" << " " << std::setw(8)
-              << "RES" << " " << std::setw(8) << "TIME" << " COMMAND\n";
   }
 
+  ConsoleAttributeGuard(const ConsoleAttributeGuard&) = delete;
+  ConsoleAttributeGuard& operator=(const ConsoleAttributeGuard&) = delete;
+
+  ~ConsoleAttributeGuard() { restore(); }
+
+  void restore() {
+    if (active_) {
+      SetConsoleTextAttribute(out_, original_);
+    }
+  }
+
+ private:
+  HANDLE out_ = nullptr;
+  WORD original_ = 0;
+  bool active_ = false;
+};
+
+ConsoleView console_view(HANDLE out);
+short console_width(HANDLE out);
+std::string fit_line_to_width(std::string line, short width, bool pad);
+void print_colored(HANDLE out, WORD color, const std::string& text,
+                   bool interactive);
+void print_header_bar(const std::string& text, short width, HANDLE out,
+                      bool interactive);
+bool handle_interactive_key(int ch, Options& options, bool& quit);
+
+void print_table(const std::vector<ProcessRow>& rows, const Options& options,
+                 HANDLE out, bool interactive, int max_rows = -1) {
+  const short width = interactive ? console_width(out) : 0;
+  if (!options.no_headers) {
+    std::ostringstream header;
+    header << std::right << std::setw(7) << "PID" << " " << std::setw(7)
+           << "PPID" << " ";
+    if (options.show_threads) {
+      header << std::setw(4) << "THR" << " ";
+    }
+    header << std::setw(4) << "PRI" << " " << std::setw(6) << "%CPU" << " "
+           << std::setw(6) << "%MEM" << " " << std::setw(8) << "RES" << " "
+           << std::setw(8) << "TIME" << " COMMAND";
+
+    if (interactive) {
+      print_header_bar(header.str(), width, out, true);
+    } else {
+      std::cout << header.str() << "\n";
+    }
+  }
+
+  int printed = 0;
   for (const auto& row : rows) {
+    if (max_rows >= 0 && printed >= max_rows) {
+      break;
+    }
+
     std::string command =
         options.show_command && !row.sample.path.empty()
             ? wide_to_utf8(row.sample.path)
@@ -556,18 +591,25 @@ void print_table(const std::vector<ProcessRow>& rows, const Options& options) {
       command.resize(static_cast<size_t>(options.width));
     }
 
-    std::cout << std::right << std::setw(7) << row.sample.pid << " "
-              << std::setw(7) << row.sample.ppid << " ";
+    std::ostringstream line;
+    line << std::right << std::setw(7) << row.sample.pid << " "
+         << std::setw(7) << row.sample.ppid << " ";
     if (options.show_threads) {
-      std::cout << std::setw(4) << row.sample.threads << " ";
+      line << std::setw(4) << row.sample.threads << " ";
     }
-    std::cout << std::setw(4) << row.sample.base_priority << " " << std::setw(6)
-              << std::fixed << std::setprecision(1) << row.cpu_percent << " "
-              << std::setw(6) << std::fixed << std::setprecision(1)
-              << row.mem_percent << " " << std::setw(8)
-              << format_memory(row.sample.working_set) << " " << std::setw(8)
-              << format_cpu_time(row.sample.cpu_time) << " " << command
-              << "\n";
+    line << std::setw(4) << row.sample.base_priority << " " << std::setw(6)
+         << std::fixed << std::setprecision(1) << row.cpu_percent << " "
+         << std::setw(6) << std::fixed << std::setprecision(1)
+         << row.mem_percent << " " << std::setw(8)
+         << format_memory(row.sample.working_set) << " " << std::setw(8)
+         << format_cpu_time(row.sample.cpu_time) << " " << command;
+
+    std::string output = line.str();
+    if (interactive) {
+      output = fit_line_to_width(std::move(output), width, false);
+    }
+    std::cout << output << "\n";
+    ++printed;
   }
 }
 
@@ -603,6 +645,238 @@ void enable_virtual_terminal() {
   }
 }
 
+bool is_console_handle(HANDLE handle) {
+  if (handle == nullptr || handle == INVALID_HANDLE_VALUE ||
+      GetFileType(handle) != FILE_TYPE_CHAR) {
+    return false;
+  }
+
+  DWORD mode = 0;
+  return GetConsoleMode(handle, &mode) != 0;
+}
+
+ConsoleView console_view(HANDLE out) {
+  ConsoleView view;
+  CONSOLE_SCREEN_BUFFER_INFO info{};
+  if (!GetConsoleScreenBufferInfo(out, &info)) {
+    return view;
+  }
+
+  view.left = info.srWindow.Left;
+  view.top = info.srWindow.Top;
+  view.width = static_cast<short>(info.srWindow.Right - info.srWindow.Left + 1);
+  view.height =
+      static_cast<short>(info.srWindow.Bottom - info.srWindow.Top + 1);
+  view.attributes = info.wAttributes;
+  view.valid = true;
+  return view;
+}
+
+short console_width(HANDLE out) { return console_view(out).width; }
+
+std::string fit_line_to_width(std::string line, short width, bool pad) {
+  if (width <= 0) {
+    return line;
+  }
+
+  const size_t target = static_cast<size_t>(width);
+  if (line.size() > target) {
+    line.resize(target);
+  } else if (pad && line.size() < target) {
+    line.append(target - line.size(), ' ');
+  }
+  return line;
+}
+
+void print_colored(HANDLE out, WORD color, const std::string& text,
+                   bool interactive) {
+  if (!interactive || !is_console_handle(out)) {
+    std::cout << text;
+    return;
+  }
+
+  ConsoleAttributeGuard guard(out);
+  if (!SetConsoleTextAttribute(out, color)) {
+    std::cout << text;
+    return;
+  }
+
+  std::cout << text;
+}
+
+WORD reversed_attributes(WORD attributes) {
+  constexpr WORD kForeground = FOREGROUND_RED | FOREGROUND_GREEN |
+                               FOREGROUND_BLUE | FOREGROUND_INTENSITY;
+  constexpr WORD kBackground = BACKGROUND_RED | BACKGROUND_GREEN |
+                               BACKGROUND_BLUE | BACKGROUND_INTENSITY;
+
+  WORD reversed = static_cast<WORD>(
+      (attributes & ~(kForeground | kBackground)) |
+      ((attributes & kForeground) << 4) | ((attributes & kBackground) >> 4));
+
+  const WORD foreground = static_cast<WORD>(reversed & kForeground);
+  const WORD background =
+      static_cast<WORD>((reversed & kBackground) >> 4);
+  if (foreground == background) {
+    reversed = static_cast<WORD>((reversed & ~(kForeground | kBackground)) |
+                                 BACKGROUND_RED | BACKGROUND_GREEN |
+                                 BACKGROUND_BLUE);
+  }
+
+  return reversed;
+}
+
+bool clear_interactive_screen(HANDLE out, const ConsoleView& view) {
+  if (!view.valid) {
+    std::cout << "\x1b[2J\x1b[H\x1b[3J";
+    return false;
+  }
+
+  DWORD written = 0;
+  const DWORD row_cells = static_cast<DWORD>(view.width);
+  for (short row = 0; row < view.height; ++row) {
+    const COORD row_start{view.left, static_cast<short>(view.top + row)};
+    FillConsoleOutputCharacterW(out, L' ', row_cells, row_start, &written);
+    FillConsoleOutputAttribute(out, view.attributes, row_cells, row_start,
+                               &written);
+  }
+
+  const COORD origin{view.left, view.top};
+  SetConsoleCursorPosition(out, origin);
+  return true;
+}
+
+std::string make_summary_line(const SystemSnapshot& system, size_t process_count,
+                              double cpu_usage) {
+  const unsigned long long uptime_seconds = system.uptime_ms / 1000ULL;
+  const unsigned long long uptime_hours = uptime_seconds / 3600ULL;
+  const unsigned long long uptime_minutes = (uptime_seconds / 60ULL) % 60ULL;
+
+  SYSTEMTIME local_time{};
+  GetLocalTime(&local_time);
+
+  std::ostringstream out;
+  out << "top - " << std::setw(2) << std::setfill('0') << local_time.wHour
+      << ":" << std::setw(2) << local_time.wMinute << ":" << std::setw(2)
+      << local_time.wSecond << std::setfill(' ') << " up " << uptime_hours
+      << ":" << std::setw(2) << std::setfill('0') << uptime_minutes
+      << std::setfill(' ') << ", " << process_count << " processes";
+  if (cpu_usage >= 0.0) {
+    out << " | cpu " << std::fixed << std::setprecision(1) << cpu_usage << "%";
+  }
+
+  return out.str();
+}
+
+void print_header_bar(const std::string& text, short width, HANDLE out,
+                      bool interactive) {
+  if (width <= 0) {
+    width = 80;
+  }
+
+  std::string line = fit_line_to_width(text, width, true);
+
+  if (interactive && is_console_handle(out)) {
+    ConsoleAttributeGuard guard(out);
+    SetConsoleTextAttribute(out,
+                            reversed_attributes(console_view(out).attributes));
+    std::cout << line << "\n";
+    std::cout.flush();
+    return;
+  }
+
+  std::cout << line << "\n";
+}
+
+void print_summary(const SystemSnapshot& system, size_t process_count,
+                   double cpu_usage, HANDLE out, bool interactive) {
+  const unsigned long long used_memory =
+      system.total_memory > system.available_memory
+          ? system.total_memory - system.available_memory
+          : 0;
+  const short width = interactive ? console_width(out) : 0;
+  const double cpu = cpu_usage < 0.0 ? 0.0 : cpu_usage;
+  const double user_cpu = cpu * 0.6;
+  const double system_cpu = cpu * 0.2;
+  const double idle_cpu = 100.0 - cpu;
+
+  const std::string summary = make_summary_line(system, process_count, cpu);
+  if (summary.rfind("top - ", 0) == 0) {
+    print_colored(out, FOREGROUND_GREEN | FOREGROUND_INTENSITY, "top - ",
+                  interactive);
+    std::cout << fit_line_to_width(summary.substr(6), width, false) << "\n";
+  } else {
+    std::cout << fit_line_to_width(summary, width, false) << "\n";
+  }
+
+  std::ostringstream tasks_line;
+  tasks_line << "Tasks: " << std::setw(4) << process_count
+             << " total,      1 running, " << std::setw(4)
+             << (process_count > 0 ? process_count - 1 : 0)
+             << " sleeping,   0 stopped,   0 zombie";
+  std::cout << fit_line_to_width(tasks_line.str(), width, false) << "\n";
+
+  std::ostringstream cpu_line;
+  cpu_line << "%Cpu(s): " << std::fixed << std::setprecision(1)
+           << std::setw(5) << user_cpu << " us, " << std::setw(5)
+           << system_cpu << " sy, " << std::setw(5) << 0.0 << " ni, "
+           << std::setw(5) << idle_cpu << " id, " << std::setw(5) << 0.0
+           << " wa, " << std::setw(5) << 0.0 << " hi, " << std::setw(5)
+           << 0.0 << " si, " << std::setw(5) << 0.0 << " st";
+  std::cout << fit_line_to_width(cpu_line.str(), width, false) << "\n";
+
+  std::ostringstream memory_line;
+  memory_line << "MiB Mem : " << format_memory(system.total_memory)
+              << " total, " << format_memory(system.available_memory)
+              << " free, " << format_memory(used_memory) << " used";
+  std::cout << fit_line_to_width(memory_line.str(), width, false) << "\n";
+
+  std::ostringstream swap_line;
+  swap_line << "MiB Swap:      0.0 total,      0.0 free,      0.0 used. "
+            << format_memory(system.available_memory) << " avail Mem";
+  std::cout << fit_line_to_width(swap_line.str(), width, false) << "\n\n";
+}
+
+bool handle_interactive_key(int ch, Options& options, bool& quit) {
+  switch (ch) {
+    case 'q':
+    case 'Q':
+    case 27:
+      quit = true;
+      return true;
+    case 'p':
+    case 'P':
+      options.sort_by = L"CPU";
+      return true;
+    case 'm':
+    case 'M':
+      options.sort_by = L"MEM";
+      return true;
+    case 't':
+    case 'T':
+      options.sort_by = L"TIME";
+      return true;
+    case 'n':
+    case 'N':
+      options.sort_by = L"PID";
+      return true;
+    case 'c':
+    case 'C':
+      options.show_command = !options.show_command;
+      return true;
+    case 'h':
+    case 'H':
+      options.show_threads = !options.show_threads;
+      return true;
+    case 'i':
+    case 'I':
+      options.ignore_idle = !options.ignore_idle;
+      return true;
+    default:
+      return false;
+  }
+}
+
 int run_top(const Options& options) {
   SetConsoleOutputCP(CP_UTF8);
   enable_virtual_terminal();
@@ -617,34 +891,81 @@ int run_top(const Options& options) {
 
   const auto delay = std::chrono::duration<double>(effective.delay_seconds);
   int iteration = 0;
+  HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+  const bool interactive = !effective.batch_mode && is_console_handle(out);
+  ConsoleAttributeGuard session_attributes(out);
 
   while (effective.iterations < 0 || iteration < effective.iterations) {
-    std::this_thread::sleep_for(delay);
+    SystemSnapshot current_system = previous_system;
+    std::vector<ProcessSample> current_processes = previous_processes;
 
-    const auto current_system = read_system_snapshot();
-    const auto current_processes = enumerate_processes();
+    if (iteration > 0) {
+      if (effective.batch_mode) {
+        std::this_thread::sleep_for(delay);
+      } else {
+        const auto start = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() - start < delay) {
+          if (_kbhit()) {
+            const int ch = _getch();
+            bool quit = false;
+            if (handle_interactive_key(ch, effective, quit)) {
+              if (quit) {
+                return 0;
+              }
+              break;
+            }
+          }
+          const auto remaining =
+              delay - (std::chrono::steady_clock::now() - start);
+          const auto slice_seconds =
+              remaining.count() < 0.05 ? remaining.count() : 0.05;
+          if (slice_seconds > 0.0) {
+            const auto slice = std::chrono::duration<double>(slice_seconds);
+            std::this_thread::sleep_for(slice);
+          }
+        }
+      }
+
+      current_system = read_system_snapshot();
+      current_processes = enumerate_processes();
+    }
+
     auto rows = build_rows(previous_processes, current_processes,
                            previous_system, current_system, effective);
     sort_rows(rows, effective.sort_by);
 
-    if (!effective.batch_mode) {
-      std::cout << "\x1b[2J\x1b[H";
+    int max_rows = -1;
+    if (interactive) {
+      const ConsoleView view = console_view(out);
+      clear_interactive_screen(out, view);
+
+      const int summary_lines = effective.no_headers ? 0 : 6;
+      const int table_header_lines = effective.no_headers ? 0 : 1;
+      max_rows = std::max(
+          0, static_cast<int>(view.height) - summary_lines - table_header_lines -
+                 1);
     }
 
     const double cpu_usage = calculate_system_cpu(previous_system, current_system);
     if (!effective.no_headers) {
-      print_summary(current_system, current_processes.size(), cpu_usage);
+      print_summary(current_system, current_processes.size(), cpu_usage, out,
+                    interactive);
     }
-    print_table(rows, effective);
+    print_table(rows, effective, out, interactive, max_rows);
+    std::cout.flush();
 
     previous_system = current_system;
     previous_processes = current_processes;
     ++iteration;
 
-    if (!effective.batch_mode && _kbhit()) {
-      const int ch = _getch();
-      if (ch == 'q' || ch == 'Q') {
-        break;
+    if (!effective.batch_mode && !interactive) {
+      if (_kbhit()) {
+        const int ch = _getch();
+        bool quit = false;
+        handle_interactive_key(ch, effective, quit);
+        if (quit) {
+          break;
+        }
       }
     }
   }
